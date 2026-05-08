@@ -1,12 +1,13 @@
-# PDON
+# PDON: Explicit PDE Solver
 
-Visual summary:
+Model Introduction: PDON first compresses high-dimensional spatial snapshots into a low-dimensional latent coefficient sequence.
+A temporal core then advances these coefficients through time, so the model learns dynamics in latent space rather than fitting the whole space--time grid at once. Finally, PDON decodes the evolved latent states back to the physical field, producing the full predicted PDE trajectory.
 
 <!-- - **Main document**: [`sources/Web/main.pdf`](sources/Web/main.pdf) -->
 
 [![Main overview](sources/Web/main.png)](sources/Web/main.pdf)
 
-## Quick visuals
+## Sequence Generation: Beltmari 3D and 2D
 
 ![2D demo](sources/Web/2d_2.gif)
 
