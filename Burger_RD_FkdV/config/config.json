@@ -1,0 +1,25 @@
+{
+  "model": "mamba_scratch",
+  "model_args": {
+    "discretization": "IMEX",
+    "dt": 1.0,
+    "dt_min": 0.001,
+    "dt_max": 1.0
+  },
+  "training": {
+    "num_epochs": 100,
+    "batch_size": 16,
+    "lr": 0.001
+  },
+  "data": {
+    "grid_x": 100,
+    "grid_t": 100,
+    "T": 1,
+    "N_train": 27000,
+    "N_test": 3000
+  },
+  "seed": 0,
+  "profile_timing": 1,
+  "track_linoss_param": "blocks.0.model_t.linoss_A_diag",
+  "track_linoss_index": 0
+}

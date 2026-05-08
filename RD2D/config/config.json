@@ -1,0 +1,46 @@
+{
+  "model": "OSS",
+  "num_epochs": 1000,
+  "batch_size": 16,
+  "lr": 0.001,
+  "eval_interval": 100,
+  "SEED": 0,
+  "grid_t": 100,
+  "K": 4,
+  "N_train": 10000,
+  "N_test": 1000,
+  "data2cuda": 1,
+
+  "oss_hidden_dim": 256,
+  "oss_num_layers": 2,
+  "oss_discretization": "IMEX",
+  "oss_dt": 1.0,
+  "oss_dt_min": 0.001,
+  "oss_dt_max": 1.0,
+  "oss_use_layernorm": 1,
+  "oss_residual_weight": 0.0,
+  "oss_proj_dropout": 0.0,
+  "oss_robust_dt_init": 0,
+
+  "oss_use_input_dt": 1,
+
+  "oss_use_input_drive_damping": 1,
+  "oss_input_drive_scale": 0.02,
+  "oss_input_damping_scale": 0.02,
+
+  "oss_use_d_skip": 1,
+  "oss_d_skip_init": 1.0,
+
+  "oss_use_osc_gate": 0,
+
+  "oss_use_causal_prefilter": 0,
+  "oss_prefilter_kernel_size": 3,
+
+  "oss_use_expand_project": 0,
+  "oss_expand_factor": 2,
+  "oss_expand_init_scale": 0.02,
+
+  "oss_use_coupled_oscillators": 0,
+  "oss_coupling_rank": 4,
+  "oss_coupling_scale": 0.05
+}

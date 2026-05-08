@@ -1,0 +1,7 @@
+{
+  "checkpoint_path": "Example_1+1_Dim/run/19/weights/best_model.pth",
+  "target_grid_x": 50,
+  "target_grid_t": 50,
+  "N_test": 3000,
+  "seed": 0
+}

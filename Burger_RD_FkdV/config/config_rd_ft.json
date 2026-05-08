@@ -1,0 +1,32 @@
+{
+  "model": "OSS",
+  "model_args": {
+    "oss_num_layers": 2,
+    "discretization": "IM",
+    "oss_dt": 1.0,
+    "oss_dt_min": 0.001,
+    "oss_dt_max": 1.0
+  },
+  "training": {
+    "num_epochs": 1000,
+    "batch_size": 16,
+    "lr": 0.001,
+    "eval_interval": 10
+  },
+  "data": {
+    "grid_x": 20,
+    "grid_t": 200,
+    "T": 10.0,
+    "N_train": 450,
+    "N_test": 50
+  },
+  "SEED": 0,
+  "LSTM_hidden_dim": 256,
+  "LSTM_num_layers": 1,
+  "GRU_hidden_dim": 256,
+  "GRU_num_layers": 1,
+  "MambaLLM_d_model": 256,
+  "MambaLLM_n_layer": 1,
+  "save_loss": 0,
+  "save_model": 0
+}

@@ -1,0 +1,1201 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GRU(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers):
+        super(GRU, self).__init__()
+        self.in_proj = nn.Linear(input_dim, hidden_dim)
+        self.lstm = nn.GRU(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, output_dim)  # Output layer to match input dimensions
+
+    def forward(self, x):
+        x = self.in_proj(x)
+        lstm_out, _ = self.lstm(x)
+        out = self.out_proj(lstm_out)
+        return out
+
+class LSTM(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers):
+        super(LSTM, self).__init__()
+        self.in_proj = nn.Linear(input_dim, hidden_dim)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, output_dim)  # Output layer to match input dimensions
+
+    def forward(self, x):
+        x = self.in_proj(x)
+        lstm_out, (_, _) = self.lstm(x)
+        out = self.out_proj(lstm_out)
+        return out
+
+
+from mamba_scratch import MambaScratch
+
+
+def _oss_rollout_im(
+    x,
+    omega2,
+    damping,
+    drive,
+    dt,
+    d_skip,
+    couple_omega_u,
+    couple_omega_v,
+    couple_damping_factor,
+    couple_drive_u,
+    couple_drive_v,
+    coupling_scale,
+):
+    batch_size, seq_len, d_model = x.shape
+    h = torch.zeros(batch_size, d_model, device=x.device, dtype=x.dtype)
+    v = torch.zeros(batch_size, d_model, device=x.device, dtype=x.dtype)
+    ys = torch.empty(batch_size, seq_len, d_model, device=x.device, dtype=x.dtype)
+
+    for t in range(seq_len):
+        u_t = x[:, t, :]
+        dt_t = dt if dt.dim() == 1 else dt[:, t, :]
+        damping_t = damping if damping.dim() == 1 else damping[:, t, :]
+        drive_t = drive if drive.dim() == 1 else drive[:, t, :]
+
+        omega_term = omega2 * h
+        damping_term = damping_t * v
+        drive_coeff = drive_t
+
+        if coupling_scale > 0.0 and couple_omega_u.numel() > 0:
+            omega_term = omega_term + coupling_scale * ((h @ couple_omega_u) @ couple_omega_v)
+            damping_term = damping_term + coupling_scale * ((v @ couple_damping_factor) @ couple_damping_factor.transpose(0, 1))
+            drive_coeff = drive_coeff + coupling_scale * ((u_t @ couple_drive_u) @ couple_drive_v)
+
+        inv_denom = 1.0 / (1.0 + (dt_t * dt_t) * omega2)
+        rhs = v + dt_t * (-omega_term - damping_term + drive_coeff * u_t)
+        v = rhs * inv_denom
+        h = h + dt_t * v
+        ys[:, t, :] = h + d_skip * u_t
+
+    return ys
+
+
+def _oss_rollout_imex(
+    x,
+    omega2,
+    damping,
+    drive,
+    dt,
+    d_skip,
+    couple_omega_u,
+    couple_omega_v,
+    couple_damping_factor,
+    couple_drive_u,
+    couple_drive_v,
+    coupling_scale,
+):
+    batch_size, seq_len, d_model = x.shape
+    h = torch.zeros(batch_size, d_model, device=x.device, dtype=x.dtype)
+    v = torch.zeros(batch_size, d_model, device=x.device, dtype=x.dtype)
+    ys = torch.empty(batch_size, seq_len, d_model, device=x.device, dtype=x.dtype)
+
+    for t in range(seq_len):
+        u_t = x[:, t, :]
+        dt_t = dt if dt.dim() == 1 else dt[:, t, :]
+        damping_t = damping if damping.dim() == 1 else damping[:, t, :]
+        drive_t = drive if drive.dim() == 1 else drive[:, t, :]
+
+        omega_term = omega2 * h
+        damping_term = damping_t * v
+        drive_coeff = drive_t
+
+        if coupling_scale > 0.0 and couple_omega_u.numel() > 0:
+            omega_term = omega_term + coupling_scale * ((h @ couple_omega_u) @ couple_omega_v)
+            damping_term = damping_term + coupling_scale * ((v @ couple_damping_factor) @ couple_damping_factor.transpose(0, 1))
+            drive_coeff = drive_coeff + coupling_scale * ((u_t @ couple_drive_u) @ couple_drive_v)
+
+        v = v + dt_t * (-omega_term - damping_term + drive_coeff * u_t)
+        h = h + dt_t * v
+        ys[:, t, :] = h + d_skip * u_t
+
+    return ys
+
+
+class OSSBlock(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        discretization="IMEX",
+        dt=1.0,
+        dt_min=1e-3,
+        dt_max=1.0,
+        use_layernorm=False,
+        proj_dropout=0.0,
+        robust_dt_init=False,
+        use_input_dt=False,
+        use_d_skip=False,
+        d_skip_init=1.0,
+        use_input_drive_damping=False,
+        input_drive_scale=1.0,
+        input_damping_scale=1.0,
+        use_osc_gate=False,
+        use_causal_prefilter=False,
+        prefilter_kernel_size=3,
+        use_expand_project=False,
+        expand_factor=2,
+        expand_init_scale=0.02,
+        use_coupled_oscillators=False,
+        coupling_rank=4,
+        coupling_scale=0.05,
+    ):
+        super().__init__()
+        self.pre_rollout_norm = nn.LayerNorm(d_model) if bool(use_layernorm) else nn.Identity()
+        self.pre_rollout_dropout = nn.Dropout(float(proj_dropout))
+
+        self.use_expand_project = bool(use_expand_project)
+        self.expand_factor = int(max(1, expand_factor))
+        self.expand_init_scale = float(expand_init_scale)
+        self.core_dim = d_model * self.expand_factor if self.use_expand_project else d_model
+        if self.use_expand_project:
+            self.expand_in = nn.Linear(d_model, self.core_dim)
+            self.expand_out = nn.Linear(self.core_dim, d_model)
+            nn.init.normal_(self.expand_in.weight, mean=0.0, std=self.expand_init_scale)
+            nn.init.normal_(self.expand_out.weight, mean=0.0, std=self.expand_init_scale)
+        else:
+            self.expand_in = None
+            self.expand_out = None
+
+        self.dt_min = float(dt_min)
+        self.dt_max = float(dt_max)
+        if not (0.0 < self.dt_min < self.dt_max):
+            raise ValueError(f"Invalid dt bounds: dt_min={self.dt_min}, dt_max={self.dt_max}")
+
+        dt_init = float(dt)
+        dt_init = min(max(dt_init, self.dt_min + 1e-6), self.dt_max - 1e-6)
+        dt_ratio = (dt_init - self.dt_min) / (self.dt_max - self.dt_min)
+        if bool(robust_dt_init):
+            dt_ratio = min(max(dt_ratio, 1e-6), 1.0 - 1e-6)
+        dt_logit_init = float(torch.logit(torch.tensor(dt_ratio)).item())
+        self.dt_logits = nn.Parameter(torch.full((self.core_dim,), dt_logit_init, dtype=torch.float32))
+
+        self.use_input_dt = bool(use_input_dt)
+        self.use_d_skip = bool(use_d_skip)
+        self.use_input_drive_damping = bool(use_input_drive_damping)
+        self.input_drive_scale = float(input_drive_scale)
+        self.input_damping_scale = float(input_damping_scale)
+        self.use_osc_gate = bool(use_osc_gate)
+        self.use_causal_prefilter = bool(use_causal_prefilter)
+        self.use_coupled_oscillators = bool(use_coupled_oscillators)
+        self.coupling_rank = int(max(1, coupling_rank))
+        self.coupling_scale = float(coupling_scale)
+
+        self.dt_in_proj = nn.Linear(self.core_dim, self.core_dim) if self.use_input_dt else None
+        self.drive_in_proj = nn.Linear(self.core_dim, self.core_dim) if self.use_input_drive_damping else None
+        self.damping_in_proj = nn.Linear(self.core_dim, self.core_dim) if self.use_input_drive_damping else None
+        self.gate_in_proj = nn.Linear(self.core_dim, self.core_dim) if self.use_osc_gate else None
+
+        if self.use_causal_prefilter:
+            kernel_size = int(prefilter_kernel_size)
+            if kernel_size < 1:
+                raise ValueError("prefilter_kernel_size must be >= 1")
+            self.prefilter_kernel_size = kernel_size
+            self.prefilter = nn.Conv1d(
+                in_channels=self.core_dim,
+                out_channels=self.core_dim,
+                kernel_size=kernel_size,
+                groups=self.core_dim,
+                bias=True,
+            )
+        else:
+            self.prefilter_kernel_size = 1
+            self.prefilter = None
+
+        self.discretization = discretization.upper()
+        if self.discretization not in {"IM", "IMEX"}:
+            raise ValueError(f"Invalid discretization '{discretization}'. Use 'IM' or 'IMEX'.")
+
+        self.omega = nn.Parameter(torch.randn(self.core_dim) * 0.02)
+        self.damping = nn.Parameter(torch.randn(self.core_dim) * 0.02)
+        self.drive = nn.Parameter(torch.randn(self.core_dim) * 0.02)
+        self.d_skip = nn.Parameter(torch.full((self.core_dim,), float(d_skip_init), dtype=torch.float32))
+
+        if self.use_coupled_oscillators:
+            self.couple_omega_u = nn.Parameter(torch.randn(self.core_dim, self.coupling_rank) * 0.02)
+            self.couple_omega_v = nn.Parameter(torch.randn(self.coupling_rank, self.core_dim) * 0.02)
+            self.couple_damping_factor = nn.Parameter(torch.randn(self.core_dim, self.coupling_rank) * 0.02)
+            self.couple_drive_u = nn.Parameter(torch.randn(self.core_dim, self.coupling_rank) * 0.02)
+            self.couple_drive_v = nn.Parameter(torch.randn(self.coupling_rank, self.core_dim) * 0.02)
+        else:
+            self.register_buffer("couple_omega_u", torch.empty(0), persistent=False)
+            self.register_buffer("couple_omega_v", torch.empty(0), persistent=False)
+            self.register_buffer("couple_damping_factor", torch.empty(0), persistent=False)
+            self.register_buffer("couple_drive_u", torch.empty(0), persistent=False)
+            self.register_buffer("couple_drive_v", torch.empty(0), persistent=False)
+
+    def forward(self, x):
+        x = self.pre_rollout_norm(x)
+        x = self.pre_rollout_dropout(x)
+        if self.use_expand_project:
+            x = self.expand_in(x)
+
+        if self.use_causal_prefilter:
+            x_conv = x.transpose(1, 2)
+            x_conv = F.pad(x_conv, (self.prefilter_kernel_size - 1, 0))
+            x = self.prefilter(x_conv).transpose(1, 2)
+
+        omega = F.softplus(self.omega)
+        if self.use_input_drive_damping:
+            drive = self.drive.view(1, 1, -1) + self.input_drive_scale * self.drive_in_proj(x)
+            damping_logits = self.damping.view(1, 1, -1) + self.input_damping_scale * self.damping_in_proj(x)
+            damping = F.softplus(damping_logits)
+        else:
+            drive = self.drive
+            damping = F.softplus(self.damping)
+        omega2 = omega * omega
+
+        if self.use_input_dt:
+            dt_logits = self.dt_in_proj(x) + self.dt_logits.view(1, 1, -1)
+        else:
+            dt_logits = self.dt_logits
+        dt = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(dt_logits)
+        dt = dt.to(device=x.device, dtype=x.dtype)
+
+        d_skip = self.d_skip if self.use_d_skip else torch.zeros_like(self.d_skip)
+        d_skip = d_skip.to(device=x.device, dtype=x.dtype)
+
+        if self.discretization == "IM":
+            y = _oss_rollout_im(
+                x,
+                omega2,
+                damping,
+                drive,
+                dt,
+                d_skip,
+                self.couple_omega_u,
+                self.couple_omega_v,
+                self.couple_damping_factor,
+                self.couple_drive_u,
+                self.couple_drive_v,
+                self.coupling_scale if self.use_coupled_oscillators else 0.0,
+            )
+        else:
+            y = _oss_rollout_imex(
+                x,
+                omega2,
+                damping,
+                drive,
+                dt,
+                d_skip,
+                self.couple_omega_u,
+                self.couple_omega_v,
+                self.couple_damping_factor,
+                self.couple_drive_u,
+                self.couple_drive_v,
+                self.coupling_scale if self.use_coupled_oscillators else 0.0,
+            )
+
+        if self.use_osc_gate:
+            gate = F.silu(self.gate_in_proj(x))
+            y = y * gate
+
+        if self.use_expand_project:
+            y = self.expand_out(y)
+        return y
+
+
+class OSS_NO(nn.Module):
+    def __init__(
+        self,
+        d_model,
+        input_dim,
+        output_dim,
+        num_layers=1,
+        discretization="IMEX",
+        dt=1.0,
+        dt_min=1e-3,
+        dt_max=1.0,
+        use_layernorm=False,
+        residual_weight=0.0,
+        proj_dropout=0.0,
+        robust_dt_init=False,
+        use_input_dt=False,
+        use_d_skip=False,
+        d_skip_init=1.0,
+        use_input_drive_damping=False,
+        input_drive_scale=1.0,
+        input_damping_scale=1.0,
+        use_osc_gate=False,
+        use_causal_prefilter=False,
+        prefilter_kernel_size=3,
+        use_expand_project=False,
+        expand_factor=2,
+        expand_init_scale=0.02,
+        use_coupled_oscillators=False,
+        coupling_rank=4,
+        coupling_scale=0.05,
+    ):
+        super().__init__()
+        self.residual_weight = float(residual_weight)
+        self.in_proj = nn.Linear(input_dim, d_model)
+        self.out_proj = nn.Linear(d_model, output_dim)
+        self.blocks = nn.ModuleList(
+            [
+                OSSBlock(
+                    d_model=d_model,
+                    discretization=discretization,
+                    dt=dt,
+                    dt_min=dt_min,
+                    dt_max=dt_max,
+                    use_layernorm=use_layernorm,
+                    proj_dropout=proj_dropout,
+                    robust_dt_init=robust_dt_init,
+                    use_input_dt=use_input_dt,
+                    use_d_skip=use_d_skip,
+                    d_skip_init=d_skip_init,
+                    use_input_drive_damping=use_input_drive_damping,
+                    input_drive_scale=input_drive_scale,
+                    input_damping_scale=input_damping_scale,
+                    use_osc_gate=use_osc_gate,
+                    use_causal_prefilter=use_causal_prefilter,
+                    prefilter_kernel_size=prefilter_kernel_size,
+                    use_expand_project=use_expand_project,
+                    expand_factor=expand_factor,
+                    expand_init_scale=expand_init_scale,
+                    use_coupled_oscillators=use_coupled_oscillators,
+                    coupling_rank=coupling_rank,
+                    coupling_scale=coupling_scale,
+                )
+                for _ in range(int(max(1, num_layers)))
+            ]
+        )
+
+    def forward(self, x):
+        h = self.in_proj(x)
+        for block in self.blocks:
+            y = block(h)
+            h = y + self.residual_weight * h if self.residual_weight != 0.0 else y
+        return self.out_proj(h)
+
+
+class MambaScratch_NO(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        hidden_dim,
+        num_layers=1,
+        d_state=16,
+        expand=2,
+        d_conv=4,
+        dt_rank=None,
+    ):
+        super().__init__()
+        self.net = MambaScratch(
+            input_dim=input_dim,
+            d_model=hidden_dim,
+            output_dim=output_dim,
+            n_layers=num_layers,
+            d_state=d_state,
+            expand=expand,
+            d_conv=d_conv,
+            dt_rank=dt_rank,
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+import math
+from functools import partial
+import json
+import os
+import copy
+
+from collections import namedtuple
+
+from mamba_ssm.models.config_mamba import MambaConfig
+from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mha import MHA
+from mamba_ssm.modules.mlp import GatedMLP
+from mamba_ssm.modules.block import Block
+from mamba_ssm.utils.generation import GenerationMixin
+from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
+from mamba_ssm.models.config_mamba import MambaConfig
+
+try:
+    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+except ImportError:
+    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+
+
+def create_block(
+    d_model,
+    d_intermediate,
+    ssm_cfg=None,
+    attn_layer_idx=None,
+    attn_cfg=None,
+    norm_epsilon=1e-5,
+    rms_norm=False,
+    residual_in_fp32=False,
+    fused_add_norm=False,
+    layer_idx=None,
+    device=None,
+    dtype=None,
+):
+    if ssm_cfg is None:
+        ssm_cfg = {}
+    if attn_layer_idx is None:
+        attn_layer_idx = []
+    if attn_cfg is None:
+        attn_cfg = {}
+    factory_kwargs = {"device": device, "dtype": dtype}
+    if layer_idx not in attn_layer_idx:
+        # Create a copy of the config to modify
+        ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
+        ssm_layer = ssm_cfg.pop("layer", "Mamba1")
+        if ssm_layer not in ["Mamba1", "Mamba2"]:
+            raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
+        mixer_cls = partial(
+            Mamba2 if ssm_layer == "Mamba2" else Mamba,
+            layer_idx=layer_idx,
+            **ssm_cfg,
+            **factory_kwargs
+        )
+    else:
+        mixer_cls = partial(MHA, layer_idx=layer_idx, **attn_cfg, **factory_kwargs)
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+    )
+    if d_intermediate == 0:
+        mlp_cls = nn.Identity
+    else:
+        mlp_cls = partial(
+            GatedMLP, hidden_features=d_intermediate, out_features=d_model, **factory_kwargs
+        )
+    block = Block(
+        d_model,
+        mixer_cls,
+        mlp_cls,
+        norm_cls=norm_cls,
+        fused_add_norm=fused_add_norm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    block.layer_idx = layer_idx
+    return block
+
+
+def _init_weights(
+    module,
+    n_layer,
+    initializer_range=0.02,  # Now only used for embedding layer.
+    rescale_prenorm_residual=True,
+    n_residuals_per_layer=1,  # Change to 2 if we have MLP
+):
+    if isinstance(module, nn.Linear):
+        if module.bias is not None:
+            if not getattr(module.bias, "_no_reinit", False):
+                nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, std=initializer_range)
+
+    if rescale_prenorm_residual:
+        # Reinitialize selected weights subject to a common residual-scaling scheme:
+        #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
+        #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
+        for name, p in module.named_parameters():
+            if name in ["out_proj.weight", "fc2.weight"]:
+                # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
+                # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
+                # We need to reinit p since this code could be called multiple times
+                # Having just p *= scale would repeatedly scale it down
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                with torch.no_grad():
+                    p /= math.sqrt(n_residuals_per_layer * n_layer)
+
+
+class MixerModel(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_layer: int,
+        d_intermediate: int,
+        vocab_size: int,
+        ssm_cfg=None,
+        attn_layer_idx=None,
+        attn_cfg=None,
+        norm_epsilon: float = 1e-5,
+        rms_norm: bool = False,
+        initializer_cfg=None,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+
+        self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+
+        # We change the order of residual and layer norm:
+        # Instead of LN -> Attn / MLP -> Add, we do:
+        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
+        # the main branch (output of MLP / Mixer). The model definition is unchanged.
+        # This is for performance reason: we can fuse add + layer_norm.
+        self.fused_add_norm = fused_add_norm
+        if self.fused_add_norm:
+            if layer_norm_fn is None or rms_norm_fn is None:
+                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
+
+        self.layers = nn.ModuleList(
+            [
+                create_block(
+                    d_model,
+                    d_intermediate=d_intermediate,
+                    ssm_cfg=ssm_cfg,
+                    attn_layer_idx=attn_layer_idx,
+                    attn_cfg=attn_cfg,
+                    norm_epsilon=norm_epsilon,
+                    rms_norm=rms_norm,
+                    residual_in_fp32=residual_in_fp32,
+                    fused_add_norm=fused_add_norm,
+                    layer_idx=i,
+                    **factory_kwargs,
+                )
+                for i in range(n_layer)
+            ]
+        )
+
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
+            d_model, eps=norm_epsilon, **factory_kwargs
+        )
+
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=n_layer,
+                **(initializer_cfg if initializer_cfg is not None else {}),
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+            )
+        )
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return {
+            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+            for i, layer in enumerate(self.layers)
+        }
+
+    def forward(self, input_ids, inference_params=None, **mixer_kwargs):
+        hidden_states = self.embedding(input_ids)
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+            )
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        else:
+            # Set prenorm=False here since we don't need the residual
+            hidden_states = layer_norm_fn(
+                hidden_states,
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual,
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+            )
+        return hidden_states
+
+
+class Mamba_NO(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_layer: int,
+        d_intermediate: int,
+        input_dim: int,
+        output_dim: int,
+        ssm_cfg=None,
+        attn_layer_idx=None,
+        attn_cfg=None,
+        norm_epsilon: float = 1e-5,
+        rms_norm: bool = False,
+        initializer_cfg=None,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.out_embedding = nn.Linear(d_model, output_dim)
+
+        # We change the order of residual and layer norm:
+        # Instead of LN -> Attn / MLP -> Add, we do:
+        # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
+        # the main branch (output of MLP / Mixer). The model definition is unchanged.
+        # This is for performance reason: we can fuse add + layer_norm.
+        self.fused_add_norm = fused_add_norm
+        if self.fused_add_norm:
+            if layer_norm_fn is None or rms_norm_fn is None:
+                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
+
+        self.layers = nn.ModuleList(
+            [
+                create_block(
+                    d_model,
+                    d_intermediate=d_intermediate,
+                    ssm_cfg=ssm_cfg,
+                    attn_layer_idx=attn_layer_idx,
+                    attn_cfg=attn_cfg,
+                    norm_epsilon=norm_epsilon,
+                    rms_norm=rms_norm,
+                    residual_in_fp32=residual_in_fp32,
+                    fused_add_norm=fused_add_norm,
+                    layer_idx=i,
+                    **factory_kwargs,
+                )
+                for i in range(n_layer)
+            ]
+        )
+
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
+            d_model, eps=norm_epsilon, **factory_kwargs
+        )
+
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=n_layer,
+                **(initializer_cfg if initializer_cfg is not None else {}),
+                n_residuals_per_layer=1 if d_intermediate == 0 else 2,  # 2 if we have MLP
+            )
+        )
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return {
+            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+            for i, layer in enumerate(self.layers)
+        }
+
+    def forward(self, input_ids, inference_params=None, **mixer_kwargs):
+        hidden_states = self.embedding(input_ids)
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual, inference_params=inference_params, **mixer_kwargs
+            )
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        else:
+            # Set prenorm=False here since we don't need the residual
+            hidden_states = layer_norm_fn(
+                hidden_states,
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual,
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+                is_rms_norm=isinstance(self.norm_f, RMSNorm)
+            )
+
+        hidden_states = self.out_embedding(hidden_states)
+        return hidden_states
+
+
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+from einops import rearrange, repeat, reduce
+from einops.layers.torch import Rearrange
+from torch.nn.init import xavier_uniform_, constant_, xavier_normal_, orthogonal_
+from PositionalEncoding import PositionalEncoding
+import math
+# from torch_cluster import fps
+# helpers
+
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# classes
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+
+
+class PostNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x, **kwargs):
+        return self.norm(self.fn(x, **kwargs))
+
+
+class GeGELU(nn.Module):
+    """https: // paperswithcode.com / method / geglu"""
+    def __init__(self):
+        super().__init__()
+        self.fn = nn.GELU()
+
+    def forward(self, x):
+        c = x.shape[-1]  # channel last arrangement
+        return self.fn(x[..., :int(c//2)]) * x[..., int(c//2):]
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim*2),
+            GeGELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReLUFeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# Rotary position encoding utilities.
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, min_freq=1/64, scale=1.):
+        super().__init__()
+        inv_freq = 1. / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.min_freq = min_freq
+        self.scale = scale
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, coordinates, device):
+        # coordinates [b, n]
+        t = coordinates.to(device).type_as(self.inv_freq)
+        t = t * (self.scale / self.min_freq)
+        freqs = torch.einsum('... i , j -> ... i j', t, self.inv_freq)  # [b, n, d//2]
+        return torch.cat((freqs, freqs), dim=-1)  # [b, n, d]
+
+
+def rotate_half(x):
+    x = rearrange(x, '... (j d) -> ... j d', j = 2)
+    x1, x2 = x.unbind(dim = -2)
+    return torch.cat((-x2, x1), dim = -1)
+
+
+def apply_rotary_pos_emb(t, freqs):
+    return (t * freqs.cos()) + (rotate_half(t) * freqs.sin())
+
+
+def apply_2d_rotary_pos_emb(t, freqs_x, freqs_y):
+    # split t into first half and second half
+    # t: [b, h, n, d]
+    # freq_x/y: [b, n, d]
+    d = t.shape[-1]
+    t_x, t_y = t[..., :d//2], t[..., d//2:]
+
+    return torch.cat((apply_rotary_pos_emb(t_x, freqs_x),
+                      apply_rotary_pos_emb(t_y, freqs_y)), dim=-1)
+
+
+class StandardAttention(nn.Module):
+    """Standard scaled dot product attention"""
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0., causal=False):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.attend = nn.Softmax(dim = -1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+        self.causal = causal  # simple autogressive attention with upper triangular part being masked zero
+
+    def forward(self, x, mask=None):
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        if mask is not None:
+            if self.causal:
+                raise Exception('Passing in mask while attention is not causal')
+            mask_value = -torch.finfo(dots.dtype).max
+            dots = dots.masked_fill(mask, mask_value)
+
+        attn = self.attend(dots)     # similarity score
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class LinearAttention(nn.Module):
+    """
+    Contains following two types of attention, as discussed in "Choose a Transformer: Fourier or Galerkin"
+
+    Galerkin type attention, with instance normalization on Key and Value
+    Fourier type attention, with instance normalization on Query and Key
+    """
+    def __init__(self,
+                 dim,
+                 attn_type,                 # ['fourier', 'galerkin']
+                 heads=8,
+                 dim_head=64,
+                 dropout=0.,
+                 init_params=True,
+                 init_method='orthogonal',    # ['xavier', 'orthogonal']
+                 init_gain=None,
+                 cat_pos=False,
+                 pos_dim=2,
+                 ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.attn_type = attn_type
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        if attn_type == 'galerkin':
+            self.k_norm = nn.InstanceNorm1d(dim_head)
+            self.v_norm = nn.InstanceNorm1d(dim_head)
+        elif attn_type == 'fourier':
+            self.q_norm = nn.InstanceNorm1d(dim_head)
+            self.k_norm = nn.InstanceNorm1d(dim_head)
+        else:
+            raise Exception(f'Unknown attention type {attn_type}')
+
+        if not cat_pos:
+            self.to_out = nn.Sequential(
+                nn.Linear(inner_dim, dim),
+                nn.Dropout(dropout)
+            ) if project_out else nn.Identity()
+        else:
+            self.to_out = nn.Sequential(
+                nn.Linear(inner_dim + pos_dim*heads, dim),
+                nn.Dropout(dropout)
+            )
+
+        if init_gain is None:
+            self.init_gain = 1. / dim_head
+            self.diagonal_weight = 1. / dim_head
+        else:
+            self.init_gain = init_gain
+            self.diagonal_weight = init_gain
+
+        self.init_method = init_method
+        if init_params:
+            self._init_params()
+
+        self.cat_pos = cat_pos
+        self.pos_dim = pos_dim
+
+    def _init_params(self):
+        if self.init_method == 'xavier':
+            init_fn = xavier_uniform_
+        elif self.init_method == 'orthogonal':
+            init_fn = orthogonal_
+        else:
+            raise Exception('Unknown initialization')
+
+        for param in self.to_qkv.parameters():
+            if param.ndim > 1:
+                for h in range(self.heads):
+                    if self.attn_type == 'fourier':
+                        # for v
+                        init_fn(param[(self.heads * 2 + h) * self.dim_head:(self.heads * 2 + h + 1) * self.dim_head, :],
+                                gain=self.init_gain)
+                        param.data[(self.heads * 2 + h) * self.dim_head:(self.heads * 2 + h + 1) * self.dim_head,
+                        :] += self.diagonal_weight * \
+                              torch.diag(torch.ones(
+                                  param.size(-1),
+                                  dtype=torch.float32))
+                    else: # for galerkin
+                        # for q
+                        init_fn(param[h * self.dim_head:(h + 1) * self.dim_head, :], gain=self.init_gain)
+                        #
+                        param.data[h * self.dim_head:(h + 1) * self.dim_head, :] += self.diagonal_weight * \
+                                                                                    torch.diag(torch.ones(
+                                                                                        param.size(-1),
+                                                                                        dtype=torch.float32))
+
+    def norm_wrt_domain(self, x, norm_fn):
+        b = x.shape[0]
+        return rearrange(
+            norm_fn(rearrange(x, 'b h n d -> (b h) n d')),
+            '(b h) n d -> b h n d', b=b)
+
+    def forward(self, x, pos=None, not_assoc=False):
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        if self.attn_type == 'galerkin':
+            k = self.norm_wrt_domain(k, self.k_norm)
+            v = self.norm_wrt_domain(v, self.v_norm)
+        else:  # fourier
+            q = self.norm_wrt_domain(q, self.q_norm)
+            k = self.norm_wrt_domain(k, self.k_norm)
+
+        if self.cat_pos:
+            assert pos.size(-1) == self.pos_dim
+            pos = pos.unsqueeze(1)
+            pos = pos.repeat([1, self.heads, 1, 1])
+            q, k, v = [torch.cat([pos, x], dim=-1) for x in (q, k, v)]
+
+        if not_assoc:
+            # this is more efficient when n<<c
+            score = torch.matmul(q, k.transpose(-1, -2))
+            out = torch.matmul(score, v) * (1./q.shape[2])
+        else:
+            dots = torch.matmul(k.transpose(-1, -2), v)
+            out = torch.matmul(q, dots) * (1./q.shape[2])
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class GalerkinTransformer(nn.Module):
+    def __init__(self,
+                 dim_in,
+                 dim_out,
+                 dim_hid,
+                 depth,
+                 heads,
+                 dim_head,
+                 attn_type,               # ['standard', 'galerkin', 'fourier']
+                 mlp_dim, dropout=0., max_len=5000,):
+        super().__init__()
+
+        self.dim_hid = dim_hid
+
+        self.input_emb = nn.Linear(dim_in, dim_hid)
+
+        self.decoder = nn.Linear(dim_hid, dim_out)
+
+        self.pos_encoder = PositionalEncoding(dim_hid, dropout, max_len)
+
+        assert attn_type in ['standard', 'galerkin', 'fourier']
+        self.layers = nn.ModuleList([])
+
+        if attn_type == 'standard':
+            for _ in range(depth):
+                self.layers.append(nn.ModuleList([
+                    PreNorm(dim_hid, StandardAttention(dim_hid, heads=heads, dim_head=dim_head, dropout=dropout)),
+                    PreNorm(dim_hid, FeedForward(dim_hid, mlp_dim, dropout=dropout))
+                ]))
+        else:
+
+            for _ in range(depth):
+                if attn_type == 'galerkin':
+                    attn_module = LinearAttention(dim_hid, attn_type, heads=heads, dim_head=dim_head, dropout=dropout)
+                else:           # attn_type == 'fourier'
+                    attn_module = LinearAttention(dim_hid, attn_type, heads=heads, dim_head=dim_head, dropout=dropout)
+
+                attn_module._init_params()
+
+                self.layers.append(nn.ModuleList([
+                    PreNorm(dim_hid, attn_module),
+                    FeedForward(dim_hid, mlp_dim, dropout=dropout)
+                ]))
+
+    def forward(self, x):
+        x = x.permute(1, 0, 2)
+        x = self.input_emb(x) * math.sqrt(self.dim_hid)
+        x = self.pos_encoder(x)
+        x = x.permute(1, 0, 2)
+
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        x = self.decoder(x)
+        return x
+
+
+
+class Transformer(nn.Transformer):
+    def __init__(self, ninput, noutput, nhidden, nhead, dim_feedforward, nlayers, dropout=0.0, max_len=5000):
+        super(Transformer, self).__init__(d_model=nhidden, nhead=nhead, dim_feedforward=dim_feedforward, num_encoder_layers=nlayers)
+        self.model_type = 'Transformer'
+        self.src_mask = None
+        self.pos_encoder = PositionalEncoding(nhidden, dropout, max_len)
+
+        self.input_emb = nn.Linear(ninput, nhidden)
+        self.nhidden = nhidden
+        self.decoder = nn.Linear(nhidden, noutput)
+
+        # self.init_weights()
+
+    def _generate_square_subsequent_mask(self, sz):
+        return torch.log(torch.tril(torch.ones(sz,sz)))
+
+    # def init_weights(self):
+    #     initrange = 0.1
+    #     nn.init.uniform_(self.input_emb.weight, -initrange, initrange)
+    #     nn.init.zeros_(self.decoder.bias)
+    #     nn.init.uniform_(self.decoder.weight, -initrange, initrange)
+
+    def forward(self, src, has_mask=True):
+        src = src.permute(1, 0, 2)
+        if has_mask:
+            device = src.device
+            if self.src_mask is None or self.src_mask.size(0) != len(src):
+                mask = self._generate_square_subsequent_mask(len(src)).to(device)
+                self.src_mask = mask
+        else:
+            self.src_mask = None
+
+        src = self.input_emb(src) * math.sqrt(self.nhidden)
+        src = self.pos_encoder(src)
+        output = self.encoder(src, mask=self.src_mask)
+        output = self.decoder(output)
+
+        output = output.permute(1, 0, 2)
+        return output
+
+
+class MoECrossAttentionBlock(nn.Module):
+    def __init__(self, dim_hid, heads, dim_head, n_experts, resid_pdrop=0):
+        super(MoECrossAttentionBlock, self).__init__()
+        self.ln1 = nn.LayerNorm(dim_hid)
+        self.ln2 = nn.LayerNorm(dim_hid)
+        self.ln3 = nn.LayerNorm(dim_hid)
+        self.ln4 = nn.LayerNorm(dim_hid)
+        self.ln5 = nn.LayerNorm(dim_hid)
+
+        self.selfattn = LinearAttention(dim_hid, 'galerkin', heads, dim_head)
+        self.crossattn = LinearAttention(dim_hid, 'galerkin', heads, dim_head)
+
+        # if config.attn_type == 'linear':
+        #     # print('Using Linear Attention')
+        #     self.selfattn = LinearAttention(config)
+        #     self.crossattn = LinearAttention(config)
+        # else:
+        #     raise NotImplementedError
+        
+        self.act = nn.GELU
+
+        # if config.act == 'gelu':
+        #     self.act = GELU
+        # elif config.act == "tanh":
+        #     self.act = Tanh
+        # elif config.act == 'relu':
+        #     self.act = ReLU
+        # elif config.act == 'sigmoid':
+        #     self.act = Sigmoid
+
+        self.resid_drop1 = nn.Dropout(resid_pdrop)
+        self.resid_drop2 = nn.Dropout(resid_pdrop)
+
+        self.n_experts = n_experts
+
+        self.moe_mlp1 = nn.ModuleList([nn.Sequential(
+            nn.Linear(dim_hid, dim_hid),
+            self.act(),
+            nn.Linear(dim_hid, dim_hid),
+        ) for _ in range(self.n_experts)])
+
+        self.moe_mlp2 = nn.ModuleList([nn.Sequential(
+            nn.Linear(dim_hid, dim_hid),
+            self.act(),
+            nn.Linear(dim_hid, dim_hid),
+        ) for _ in range(self.n_experts)])
+
+        self.gatenet = nn.Sequential(
+            nn.Linear(dim_hid, dim_hid),
+            self.act(),
+            nn.Linear(dim_hid, dim_hid),
+            self.act(),
+            nn.Linear(dim_hid, self.n_experts)
+        )
+
+    '''
+        x: [B, T1, C], y:[B, T2, C], pos:[B, T1, n]
+    '''
+    def forward(self, x):
+        gate_score = F.softmax(self.gatenet(x),dim=-1).unsqueeze(2)    # B, T1, 1, m
+        x = x + self.resid_drop1(self.crossattn(self.ln1(x), self.ln2(x)))
+        x_moe1 = torch.stack([self.moe_mlp1[i](x) for i in range(self.n_experts)],dim=-1) # B, T1, C, m
+        x_moe1 = (gate_score*x_moe1).sum(dim=-1,keepdim=False)
+        x = x + self.ln3(x_moe1)
+        x = x + self.resid_drop2(self.selfattn(self.ln4(x)))
+        x_moe2 = torch.stack([self.moe_mlp1[i](x) for i in range(self.n_experts)],dim=-1) # B, T1, C, m
+        x_moe2 = (gate_score*x_moe2).sum(dim=-1,keepdim=False)
+        x = x + self.ln5(x_moe2)
+        return x
+
+class GNOT(nn.Module):
+    def __init__(self, dim_in, dim_out, dim_hid, depth, heads, dim_head, n_experts, dropout=0., max_len=5000):
+        super(GNOT, self).__init__()
+
+        self.dim_hid = dim_hid
+
+        self.input_emb = nn.Linear(dim_in, dim_hid)
+
+        self.decoder = nn.Linear(dim_hid, dim_out)
+
+        self.pos_encoder = PositionalEncoding(dim_hid, dropout, max_len)
+
+        # self.horiz_fourier_dim = horiz_fourier_dim
+        # self.trunk_size = trunk_size * (4*horiz_fourier_dim + 3) if horiz_fourier_dim>0 else trunk_size
+        # self.branch_size = branch_size * (4*horiz_fourier_dim + 3) if horiz_fourier_dim > 0 else branch_size
+        # self.output_size = output_size
+        # self.space_dim = space_dim
+        # self.gpt_config = MoEGPTConfig(attn_type=attn_type,embd_pdrop=ffn_dropout, resid_pdrop=ffn_dropout, attn_pdrop=attn_dropout,n_embd=n_hidden, n_head=n_head, n_layer=n_layers, block_size=128,act=act, n_experts=n_experts,space_dim=space_dim)
+
+        # self.trunk_mlp = MLP(self.trunk_size, n_hidden, n_hidden, n_layers=mlp_layers,act=act)
+        # self.branch_mlp = MLP(self.branch_size, n_hidden, n_hidden, n_layers=mlp_layers,act=act)
+
+
+        self.blocks = nn.Sequential(*[MoECrossAttentionBlock(dim_hid, heads, dim_head, n_experts) for _ in range(depth)])
+
+    def forward(self, x):
+        x = x.permute(1, 0, 2)
+        x = self.input_emb(x) * math.sqrt(self.dim_hid)
+        x = self.pos_encoder(x)
+        x = x.permute(1, 0, 2)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.decoder(x)
+
+        return x
+
+
+if __name__ == "__main__":
+    pass
