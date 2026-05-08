@@ -1,8 +1,8 @@
 # PDON
 
-Visual summary (paper-style overview):
+Visual summary:
 
-- **Main document**: [`sources/Web/main.pdf`](sources/Web/main.pdf)
+<!-- - **Main document**: [`sources/Web/main.pdf`](sources/Web/main.pdf) -->
 
 [![Main overview](sources/Web/main.png)](sources/Web/main.pdf)
 
@@ -12,7 +12,7 @@ Visual summary (paper-style overview):
 
 ![3D demo](sources/Web/3d.gif)
 
-## Repository layout (at a glance)
+## Repository layout 
 
 - **`Beltrami/`**: Beltrami-flow experiments. Main entrypoint: `Beltrami/main_beltrami.py`
 - **`Brusselator/`**: 3D Brusselator experiments. Main entrypoint: `Brusselator/main_Brusselator_3d.py`
@@ -20,9 +20,9 @@ Visual summary (paper-style overview):
 - **`RD2D/`**: 2D reaction–diffusion experiments. Main entrypoint: `RD2D/main_reaction_diffusion.py`
 - **`sources/Web/`**: pre-rendered visuals used in this README.
 
-## Run experiments (minimal)
+## Run experiments 
 
-One-line runs (examples):
+One-line runs:
 
 ```bash
 python Beltrami/main_beltrami.py --model OSS
@@ -31,15 +31,15 @@ python Burger_RD_FkdV/main_burgers.py --model OSS
 python RD2D/main_reaction_diffusion.py --model OSS
 ```
 
-## Key arguments (minimal)
+## Key arguments 
 
-- **`--model`**: selects the temporal backbone. Common options across scripts include `OSS`, `Mamba`, `GRU`, `LSTM` (some scripts also accept `MambaScratch` / `mamba_scratch`).
+- **`--model`**: selects the temporal backbone. Common options across scripts include `OSS`, `Mamba`, `GRU`, `LSTM`.
 - **`--num_epochs`**: training epochs.
 - **`--batch_size`**: minibatch size.
 - **`--lr`**: learning rate.
 
 ## Results
 
-- **OSS oscillation figure**: [`sources/Web/oss_oscil.pdf`](sources/Web/oss_oscil.pdf)
+
 
 [![Results](sources/Web/results.png)](sources/Web/results.png)
