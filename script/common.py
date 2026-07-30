@@ -30,8 +30,9 @@ REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
 
-# Fresh test seeds live far from the training seeds (0..49) so no training sample
-# is ever reused, while the generator and its settings stay identical.
+# Fresh test seeds live far from the training seeds (0..9) so no training sample is
+# ever reused, while the generator and its settings stay identical. This is the third
+# split of the protocol: train -> select on eval/validation -> score here.
 TEST_SEED_BASE = 10_000_000
 TEST_SEED_STRIDE = 1_000
 
@@ -224,7 +225,7 @@ ROW_FIELDS = [
     "test_seed",
     "n_test",
     "rel_l2",
-    "reported_selection_error",
+    "val_error_selection",
 ]
 
 
@@ -246,8 +247,8 @@ class Results:
                 continue
             key = (r["suite"], r["model"])
             groups.setdefault(key, []).append(float(r["rel_l2"]))
-            if r["reported_selection_error"] is not None:
-                reported.setdefault(key, []).append(float(r["reported_selection_error"]))
+            if r["val_error_selection"] is not None:
+                reported.setdefault(key, []).append(float(r["val_error_selection"]))
         out = []
         for (suite, model), vals in sorted(groups.items()):
             rep = reported.get((suite, model), [])
@@ -260,7 +261,7 @@ class Results:
                     "heldout_std": statistics.pstdev(vals) if len(vals) > 1 else 0.0,
                     "heldout_min": min(vals),
                     "heldout_max": max(vals),
-                    "reported_selection_mean": statistics.fmean(rep) if rep else None,
+                    "val_selection_mean": statistics.fmean(rep) if rep else None,
                 }
             )
         return out
@@ -284,9 +285,9 @@ def print_summary(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         print("  (no evaluations)")
         return
-    print(f"  {'suite':<14}{'model':<16}{'n':>4}  {'held-out mean +/- std':<26}{'selection stat':>14}")
+    print(f"  {'suite':<14}{'model':<16}{'n':>4}  {'held-out mean +/- std':<26}{'val (selection)':>16}")
     for r in rows:
-        rep = "-" if r["reported_selection_mean"] is None else f"{r['reported_selection_mean']:.4e}"
+        rep = "-" if r["val_selection_mean"] is None else f"{r['val_selection_mean']:.4e}"
         print(
             f"  {r['suite']:<14}{r['model']:<16}{r['n_evaluations']:>4}  "
             f"{r['heldout_mean']:.4e} +/- {r['heldout_std']:.2e}   {rep:>12}"

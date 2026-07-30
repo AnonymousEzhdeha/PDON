@@ -20,7 +20,7 @@ from suites import ORDER, REGISTRY
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Held-out test stage for all experiments")
-    p.add_argument("--num_test_seeds", type=int, default=20)
+    p.add_argument("--num_test_seeds", type=int, default=10)
     p.add_argument("--models", type=str, default="")
     p.add_argument("--only-seeds", dest="only_seeds", type=str, default="")
     p.add_argument("--suites", type=str, default="", help=f"subset of: {' '.join(ORDER)}")

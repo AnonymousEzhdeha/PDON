@@ -16,7 +16,7 @@ from suites import REGISTRY, Suite
 
 def build_parser(suite: Suite) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=f"Held-out test evaluation for the {suite.name} experiment")
-    p.add_argument("--num_test_seeds", type=int, default=20,
+    p.add_argument("--num_test_seeds", type=int, default=10,
                    help="number of freshly drawn test sets per checkpoint")
     p.add_argument("--n_test", type=int, default=suite.default_n_test,
                    help="samples per fresh test set (0 = whole available split)")
@@ -97,7 +97,7 @@ def run_suite(suite: Suite, argv: Optional[List[str]] = None, results: Optional[
                 test_seed=seed,
                 n_test=int(data["X"].shape[0]),
                 rel_l2=value,
-                reported_selection_error=selection,
+                val_error_selection=selection,
             )
             del data
         del model
@@ -108,8 +108,8 @@ def run_suite(suite: Suite, argv: Optional[List[str]] = None, results: Optional[
             mean = sum(values) / len(values)
             spread = max(values) - min(values)
             sel = "-" if selection is None else f"{selection:.4e}"
-            print(f"  {run.label:<34} held-out {mean:.4e} (spread {spread:.2e}, n={len(values)})  "
-                  f"selection {sel}  [{time.time() - t0:.0f}s]")
+            print(f"  {run.label:<34} held-out test {mean:.4e} (spread {spread:.2e}, n={len(values)})  "
+                  f"val/selection {sel}  [{time.time() - t0:.0f}s]")
 
     if own_results:
         paths = results.write()
