@@ -7,9 +7,13 @@ A temporal core then advances these coefficients through time, so the model lear
 
 [![Main overview](sources/Web/main.png)](sources/Web/main.pdf)
 
-## Sequence Generation: Beltmari 3D and 2D
+## Sequence Generation: Beltrami 3D and 2D
+
+**2D (`z=mid` slice).** A tracer particle is dropped at the same point in the ground-truth and predicted velocity fields and advected forward in time. Its trajectory stays nearly identical in both panels, so the predicted field reproduces the true transport, not just the instantaneous snapshot.
 
 ![2D demo](sources/Web/2d_2.gif)
+
+**3D (full volume).** The same test in 3D: one particle released in the ground-truth field and one in the predicted field, evolving under each. The two paths track each other over the whole rollout, indicating the learned dynamics remain accurate in all three dimensions.
 
 ![3D demo](sources/Web/3d.gif)
 
