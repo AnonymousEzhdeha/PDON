@@ -1,5 +1,7 @@
 # PDON: Explicit PDE Solver
 
+[![PDON 3D architecture walkthrough](sources/Web/pdon_3d_architecture.webp)](sources/Web/pdon_3d_architecture.mp4)
+
 Model Introduction: PDON first compresses high-dimensional spatial snapshots into a low-dimensional latent coefficient sequence.
 A temporal core then advances these coefficients through time, so the model learns dynamics in latent space rather than fitting the whole space--time grid at once. Finally, PDON decodes the evolved latent states back to the physical field, producing the full predicted PDE trajectory.
 
